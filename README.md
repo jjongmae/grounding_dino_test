@@ -1,5 +1,4 @@
 # grounding_dino_test
-grounding dino test
 
 ```powershell
 # config 파일 다운로드
