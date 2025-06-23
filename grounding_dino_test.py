@@ -2,16 +2,21 @@ import cv2, torch, numpy as np
 from PIL import Image
 from groundingdino.util.inference import load_model, predict
 import groundingdino.datasets.transforms as T
+from groundingdino.util import box_ops
 
 # ────────────────── 설정 ────────────────── #
 CFG  = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
 CKPT = "weights/groundingdino_swinb_cogcoor.pth"
-PROMPT = (
-    "a prefabricated house on a farm."
-    "a tall gray utility pole beside."
-    "a bridge across the highway."
-)
-VIDEO_PATH = r"D:\data\여주시험도로_20250610\카메라1_202506101340.mp4"
+PROMPT_LINES = [
+    "debris on road not car",
+    "trash on road not car",
+    "road work zone with traffic cones",
+]
+PROMPT = "\n".join(PROMPT_LINES)
+BOX_THRESHOLD  = 0.35
+TEXT_THRESHOLD = 0.25
+VIDEO_PATH = r"D:\data\도로_비정형객체\6.avi"
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ────────────────── 모델 로드 ────────────────── #
@@ -39,53 +44,55 @@ def draw(frame, boxes, labels):
                     (0, 255, 0), 2)
     return frame
 
+# ────────────────── 박스 변환 ────────────────── #
+def convert_boxes(raw_boxes, w, h):
+    # 1) 정규화 → 픽셀
+    if raw_boxes.max() <= 1:          # 최대값이 1 이하면 정규화로 간주
+        raw_boxes = raw_boxes * torch.tensor([w, h, w, h],
+                                             dtype=raw_boxes.dtype,
+                                             device=raw_boxes.device)
+
+    # 2) cxcywh → xyxy (torch 버전 함수 사용)
+    boxes_xyxy = box_ops.box_cxcywh_to_xyxy(raw_boxes)
+
+    # 3) 클리핑 + numpy 변환
+    boxes_xyxy[:, 0::2].clamp_(0, w)
+    boxes_xyxy[:, 1::2].clamp_(0, h)
+
+    return boxes_xyxy.cpu().numpy().astype(int)
+
 # ────────────────── 비디오 루프 ────────────────── #
 cap = cv2.VideoCapture(VIDEO_PATH)
 while cap.isOpened():
+    # ──────── 프레임 읽기 ──────── #
     ret, frame = cap.read()
     if not ret:
         break
 
+    # ──────── 프레임 전처리 ──────── #
     h, w = frame.shape[:2]
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img_tensor = preprocess(img_rgb).to(device)
 
+    # ──────── 모델 예측 ──────── #
     with torch.no_grad():
         raw_boxes, _, phrases = predict(
             model=model,
             image=img_tensor[0],          # (C, H, W)
             caption=PROMPT,
-            box_threshold=0.35,
-            text_threshold=0.25
+            box_threshold=BOX_THRESHOLD,
+            text_threshold=TEXT_THRESHOLD,
         )
 
+    # ──────── 박스가 없으면 건너뛰기 ──────── #
     if raw_boxes.numel() == 0:
         cv2.imshow("GroundingDINO", frame)
         if cv2.waitKey(1) == ord('q'):
             break
         continue
 
-    # ──────── ① 텐서 → NumPy ──────── #
-    boxes = raw_boxes.cpu().numpy()                    # [cx,cy,w,h] norm
-
-    # ──────── ② 정규화 → 픽셀 스케일 ──────── #
-    if boxes.max() <= 1.0:
-        boxes *= np.array([w, h, w, h])
-
-    # ──────── ③ 중심 → 모서리 변환 ──────── #
-    boxes_xyxy = boxes.copy()
-    boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2   # x0
-    boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2   # y0
-    boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2   # x1
-    boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2   # y1
-
-    # ──────── ④ 클리핑 ──────── #
-    boxes_xyxy[:, 0::2] = np.clip(boxes_xyxy[:, 0::2], 0, w)
-    boxes_xyxy[:, 1::2] = np.clip(boxes_xyxy[:, 1::2], 0, h)
-
-    # ──────── 디버그: 변환 후 출력 ──────── #
-    for i, b in enumerate(boxes_xyxy):
-        bw, bh = b[2] - b[0], b[3] - b[1]
+    # ──────── 박스 변환 ──────── #
+    boxes_xyxy = convert_boxes(raw_boxes, w, h)
 
     # ──────── 시각화 & 종료키 ──────── #
     frame = draw(frame, boxes_xyxy, phrases)
