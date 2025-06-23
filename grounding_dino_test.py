@@ -8,13 +8,13 @@ from groundingdino.util import box_ops
 CFG  = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
 CKPT = "weights/groundingdino_swinb_cogcoor.pth"
 PROMPT_LINES = [
-    "debris on road not car",
-    "trash on road not car",
-    "road work zone with traffic cones",
+    "debris on the highway",
+    "small black dot on the highway",
+    "orange cones on the highway",
 ]
 PROMPT = "\n".join(PROMPT_LINES)
-BOX_THRESHOLD  = 0.35
-TEXT_THRESHOLD = 0.25
+BOX_THRESHOLD  = 0.30
+TEXT_THRESHOLD = 0.20
 VIDEO_PATH = r"D:\data\도로_비정형객체\6.avi"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
