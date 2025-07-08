@@ -8,17 +8,15 @@ from groundingdino.util import box_ops
 CFG  = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
 CKPT = "weights/groundingdino_swinb_cogcoor.pth"
 PROMPT_LINES = [
-    "highway",
-    "road debris",    
-    "tiny black object",    
-    "standing traffic cones",
+    "debris on road",
+    "traffic cone",
 ]
 PROMPT = ". ".join(PROMPT_LINES) + "."
-BOX_THRESHOLD  = 0.30
-TEXT_THRESHOLD = 0.20
+BOX_THRESHOLD  = 0.25
+TEXT_THRESHOLD = 0.25
 MAX_AREA_RATIO = 0.5   # 전체 프레임의 50 % 이상이면 거대 박스로 간주
 IOU_THRESHOLD = 0.8
-VIDEO_PATH = r"D:\data\도로_비정형객체\3.avi"
+VIDEO_PATH = r"D:\data\도로_비정형객체1\5.avi"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -37,105 +35,92 @@ def preprocess(img_np):
     return tf(img_pil, None)[0].unsqueeze(0)          # (1, C, H, W)
 
 # ────────────────── 시각화 ────────────────── #
-def draw(frame, boxes, labels):
-    for b, l in zip(boxes, labels):
-        x0, y0, x1, y1 = map(int, b)
-        cv2.rectangle(frame, (x0, y0), (x1, y1),
-                      (0, 255, 0), 2)
-        cv2.putText(frame, l, (x0, max(y0 - 10, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (0, 255, 0), 2)
+def _label_color(label: str):
+    """라벨 문자열을 → 고정된 BGR 색상 (OpenCV용)"""
+    seed = abs(hash(label)) % (2**32)
+    rng  = np.random.default_rng(seed)
+    return tuple(int(c) for c in rng.integers(0, 256, size=3))
+
+def draw(frame, boxes, labels, scores):
+    for (x0, y0, x1, y1), lab, sc in zip(boxes, labels, scores):
+        color = _label_color(lab)
+
+        # ① 바운딩 박스 (3 px)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), color, thickness=3)
+
+        # ② 라벨 + 점수 문자열
+        text = f"{lab} {sc:.2f}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                      fontScale=0.7, thickness=2)
+
+        # ③ 글자 배경 (반투명 검정)
+        bg_tl = (x0, max(y0 - th - 6, 0))
+        bg_br = (x0 + tw + 10, y0)
+        cv2.rectangle(frame, bg_tl, bg_br, (0, 0, 0), -1)  # 채우기
+        overlay = frame.copy()
+        cv2.rectangle(overlay, bg_tl, bg_br, (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)  # 투명도 조절
+
+        # ④ 글자
+        cv2.putText(frame, text, (x0 + 5, y0 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
+                    lineType=cv2.LINE_AA)
     return frame
 
 # ────────────────── 박스 변환 ────────────────── #
 def convert_boxes(raw_boxes, w, h):
     # 1) 정규화 → 픽셀
-    if raw_boxes.max() <= 1:          # 최대값이 1 이하면 정규화로 간주
+    if raw_boxes.max() <= 1:
         raw_boxes = raw_boxes * torch.tensor([w, h, w, h],
                                              dtype=raw_boxes.dtype,
                                              device=raw_boxes.device)
-
-    # 2) cxcywh → xyxy (torch 버전 함수 사용)
+    # 2) cxcywh → xyxy
     boxes_xyxy = box_ops.box_cxcywh_to_xyxy(raw_boxes)
-
     # 3) 클리핑 + numpy 변환
     boxes_xyxy[:, 0::2].clamp_(0, w)
     boxes_xyxy[:, 1::2].clamp_(0, h)
-
     return boxes_xyxy.cpu().numpy().astype(int)
 
-# ────────────────── 필터링 ────────────────── #
-def filter_preds(boxes, labels, scores, label_blocklist=("the highway",)):
-    keep_idx = [
-        i for i, l in enumerate(labels)
-        if l.strip().lower() not in label_blocklist
-    ]
-    return boxes[keep_idx], [labels[i] for i in keep_idx], scores[keep_idx]
-
-# ────────────────── 중복 박스 제거 ────────────────── #
+# ────────────────── (선택) 필터링 함수 ────────────────── #
 def deduplicate(boxes, labels, scores, iou_thr=IOU_THRESHOLD):
     if len(boxes) == 0:
         return boxes, labels, scores
-
     keep = []
     for i, box_i in enumerate(boxes):
-        duplicate_with = None
+        dup = None
         for j in keep:
-            # box_ops.box_iou → (iou_tensor, union_tensor)
             iou_val = box_ops.box_iou(
-                torch.as_tensor(box_i[None, :], dtype=torch.float32),
-                torch.as_tensor(boxes[j][None, :], dtype=torch.float32)
-            )[0][0, 0].item()          # <- 첫 번째 텐서를 선택
-
+                torch.as_tensor(box_i[None], dtype=torch.float32),
+                torch.as_tensor(boxes[j][None], dtype=torch.float32)
+            )[0][0, 0].item()
             if iou_val > iou_thr:
-                duplicate_with = j
+                dup = j
                 break
-
-        if duplicate_with is None:          # 새 박스
+        if dup is None:
             keep.append(i)
-        else:
-            # 이미 있는 박스보다 점수가 높으면 교체
-            if scores[i] > scores[duplicate_with]:
-                keep.remove(duplicate_with)
-                keep.append(i)
-
-    # 최종 결과만 반환
-    boxes_out  = boxes[keep]
-    labels_out = [labels[k] for k in keep]
-    scores_out = scores[keep]
-    return boxes_out, labels_out, scores_out
-
-# ────────────────── 거대 박스 필터링 ────────────────── #
-def area_filter(boxes, labels, scores, w, h, max_ratio=MAX_AREA_RATIO):
-    keep = []
-    for i, (x0, y0, x1, y1) in enumerate(boxes):
-        box_area = (x1 - x0) * (y1 - y0)
-        if box_area / (w * h) < max_ratio:   # 작으면 keep
+        elif scores[i] > scores[dup]:
+            keep.remove(dup)
             keep.append(i)
-    return boxes[keep], [labels[i] for i in keep], scores[keep]
+    return boxes[keep], [labels[k] for k in keep], scores[keep]
 
 # ────────────────── 비디오 루프 ────────────────── #
 cap = cv2.VideoCapture(VIDEO_PATH)
-frame_skip = 5
+frame_skip = 5         # 매 5프레임마다 추론
 frame_count = 0
 
 while cap.isOpened():
-    # ──────── 프레임 읽기 ──────── #
     ret, frame = cap.read()
     if not ret:
         break
 
-    # ──────── 프레임 스킵 ──────── #
     frame_count += 1
     if frame_count % frame_skip != 0:
         continue
 
-    # ──────── 프레임 전처리 ──────── #
     h, w = frame.shape[:2]
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img_tensor = preprocess(img_rgb).to(device)
 
-    # ──────── 모델 예측 ──────── #
     with torch.no_grad():
         raw_boxes, scores, phrases = predict(
             model=model,
@@ -145,36 +130,20 @@ while cap.isOpened():
             text_threshold=TEXT_THRESHOLD,
         )
 
-    # ──────── 박스가 없으면 건너뛰기 ──────── #
+    # 박스가 없으면 그대로 출력
     if raw_boxes.numel() == 0:
         cv2.imshow("GroundingDINO", frame)
         if cv2.waitKey(1) == ord('q'):
             break
         continue
 
-    # ──────── 박스 변환 ──────── #
+    # ──────── 후처리 ──────── #
     boxes_xyxy = convert_boxes(raw_boxes, w, h)
-    print("-- Detected Objects --")
-    for box, score, label in zip(boxes_xyxy, scores, phrases):
-        print(f"Label: {label}, Box: {box.tolist()}, Score: {score:.2f}")
-
-    # ──────── 필터링 ──────── #
-    # boxes_xyxy, phrases, scores = filter_preds(boxes_xyxy, phrases, scores)
-
-    # ──────── 거대 박스 필터링 ──────── #
-    # boxes_xyxy, phrases, scores = area_filter(boxes_xyxy, phrases, scores, w, h)
-
-    # ──────── 중복 박스 제거 ──────── #
     boxes_xyxy, phrases, scores = deduplicate(boxes_xyxy, phrases, scores)
-    
-    # ──────── 결과 출력 ──────── #
-    print("-- Filtered Objects --")
-    for box, score, label in zip(boxes_xyxy, scores, phrases):
-        print(f"Label: {label}, Box: {box.tolist()}, Score: {score:.2f}")
 
-    # ──────── 시각화 & 종료키 ──────── #
-    frame = draw(frame, boxes_xyxy, phrases)
-    cv2.imshow("GroundingDINO", frame)
+    # ──────── 시각화 ──────── #
+    frame_vis = draw(frame, boxes_xyxy, phrases, scores)
+    cv2.imshow("GroundingDINO", frame_vis)
     if cv2.waitKey(1) == ord('q'):
         break
 
