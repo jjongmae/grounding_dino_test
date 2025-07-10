@@ -1,0 +1,185 @@
+import cv2, torch, numpy as np
+from PIL import Image
+from groundingdino.util.inference import load_model, predict
+import groundingdino.datasets.transforms as T
+from groundingdino.util import box_ops
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
+# ────────────────── 설정 ────────────────── #
+CFG  = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
+CKPT = "weights/groundingdino_swinb_cogcoor.pth"
+PROMPT_LINES = [    
+    "traffic cone",
+    "debris on road",
+]
+BOX_THRESHOLD  = 0.25
+TEXT_THRESHOLD = 0.25
+IOU_THRESHOLD = 0.8
+VIDEO_PATH = r"D:\data\도로_비정형객체1\5.avi"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ────────────────── 모델 로드 ────────────────── #
+model = load_model(CFG, CKPT).to(device).eval()
+tracker = DeepSort(max_age=30, nn_budget=100, n_init=3)
+
+# ────────────────── 전처리 ────────────────── #
+def preprocess(img_np):
+    img_pil = Image.fromarray(img_np)
+    tf = T.Compose([
+        T.RandomResize([800], max_size=1333),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406],
+                    [0.229, 0.224, 0.225])
+    ])
+    return tf(img_pil, None)[0].unsqueeze(0)          # (1, C, H, W)
+
+# ────────────────── 시각화 ────────────────── #
+def _label_color(label: str):
+    """라벨 문자열을 → 고정된 BGR 색상 (OpenCV용)"""
+    seed = abs(hash(label)) % (2**32)
+    rng  = np.random.default_rng(seed)
+    return tuple(int(c) for c in rng.integers(0, 256, size=3))
+
+def draw_tracks(frame, tracks):
+    """DeepSort 트랙들을 프레임에 그림 (확정/미확정 트랙 구분)"""
+    for track in tracks:
+        # 트랙이 유효하지 않으면 건너뛰기
+        if not track.is_confirmed() and track.time_since_update > 1:
+            continue
+
+        track_id = track.track_id
+        ltrb = track.to_ltrb()
+        det_class = track.get_det_class() or "object" # 클래스 없으면 "object"
+
+        x0, y0, x1, y1 = map(int, ltrb)
+
+        # 확정된 트랙과 미확정(tentative) 트랙을 시각적으로 구분
+        if track.is_confirmed():
+            color = _label_color(str(track_id)) # ID별 고정 색상
+            thickness = 3
+            text = f"ID:{track_id} {det_class}"
+        else:
+            color = (128, 128, 128) # 회색
+            thickness = 1
+            text = f"ID:{track_id}? ({det_class})"
+
+        # ① 바운딩 박스
+        cv2.rectangle(frame, (x0, y0), (x1, y1), color, thickness=thickness)
+
+        # ② 라벨 + ID 문자열
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                      fontScale=0.7, thickness=2)
+
+        # ③ 글자 배경
+        bg_tl = (x0, max(y0 - th - 6, 0))
+        bg_br = (x0 + tw + 10, y0)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, bg_tl, bg_br, (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+
+        # ④ 글자
+        cv2.putText(frame, text, (x0 + 5, y0 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+                    lineType=cv2.LINE_AA)
+    return frame
+
+# ────────────────── 박스 변환 ────────────────── #
+def convert_boxes(raw_boxes, w, h):
+    # 1) 정규화 → 픽셀
+    if raw_boxes.max() <= 1:
+        raw_boxes = raw_boxes * torch.tensor([w, h, w, h],
+                                             dtype=raw_boxes.dtype,
+                                             device=raw_boxes.device)
+    # 2) cxcywh → xyxy
+    boxes_xyxy = box_ops.box_cxcywh_to_xyxy(raw_boxes)
+    # 3) 클리핑 + numpy 변환
+    boxes_xyxy[:, 0::2].clamp_(0, w)
+    boxes_xyxy[:, 1::2].clamp_(0, h)
+    return boxes_xyxy.cpu().numpy().astype(int)
+
+# ────────────────── (선택) 필터링 함수 ────────────────── #
+def deduplicate(boxes, labels, scores, iou_thr=IOU_THRESHOLD):
+    if len(boxes) == 0:
+        return boxes, labels, scores
+    keep = []
+    for i, box_i in enumerate(boxes):
+        dup = None
+        for j in keep:
+            iou_val = box_ops.box_iou(
+                torch.as_tensor(box_i[None], dtype=torch.float32),
+                torch.as_tensor(boxes[j][None], dtype=torch.float32)
+            )[0][0, 0].item()
+            if iou_val > iou_thr:
+                dup = j
+                break
+        if dup is None:
+            keep.append(i)
+        elif scores[i] > scores[dup]:
+            keep.remove(dup)
+            keep.append(i)
+    return boxes[keep], [labels[k] for k in keep], scores[keep]
+
+# ────────────────── 비디오 루프 ────────────────── #
+cap = cv2.VideoCapture(VIDEO_PATH)
+frame_skip = 1         # 매 5프레임마다 추론
+frame_count = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame_count += 1
+    detections_for_tracker = []
+
+    # 'frame_skip' 프레임마다 GroundingDINO 추론 실행
+    if frame_count % frame_skip == 0:
+        h, w = frame.shape[:2]
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_tensor = preprocess(img_rgb).to(device)
+
+        boxes_all, labels_all, scores_all = [], [], []
+        with torch.no_grad():
+            for prompt in PROMPT_LINES:
+                raw_boxes, scores, phrases = predict(
+                    model=model,
+                    image=img_tensor[0],
+                    caption=prompt + ".",
+                    box_threshold=BOX_THRESHOLD,
+                    text_threshold=TEXT_THRESHOLD,
+                )
+                if raw_boxes.numel() == 0:
+                    continue
+                boxes_xyxy = convert_boxes(raw_boxes, w, h)
+                boxes_all.append(boxes_xyxy)
+                labels_all.extend(phrases)
+                scores_all.append(scores)
+
+        if boxes_all:
+            boxes_cat   = np.vstack(boxes_all)
+            scores_cat  = torch.cat(scores_all)
+            boxes_final, labels_final, scores_final = deduplicate(
+                boxes_cat, labels_all, scores_cat)
+
+            # DeepSort에 전달할 감지 결과 포맷 생성
+            for box, label, score in zip(boxes_final, labels_final, scores_final):
+                x0, y0, x1, y1 = box
+                w_box, h_box = x1 - x0, y1 - y0
+                detections_for_tracker.append(
+                    ([x0, y0, w_box, h_box], score.item(), label)
+                )
+
+    # 매 프레임마다 트래커 업데이트
+    tracks = tracker.update_tracks(detections_for_tracker, frame=frame)
+
+    # 트랙 시각화
+    frame_vis = frame.copy() # 원본 프레임에 그리지 않도록 복사
+    frame_vis = draw_tracks(frame_vis, tracks)
+    
+    cv2.imshow("GroundingDINO with DeepSort", frame_vis)
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
