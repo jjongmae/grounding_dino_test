@@ -1,4 +1,5 @@
 import cv2, torch, numpy as np
+import os, time
 from PIL import Image
 from groundingdino.util.inference import load_model, predict
 import groundingdino.datasets.transforms as T
@@ -9,10 +10,8 @@ CFG  = "groundingdino/config/GroundingDINO_SwinB_cfg.py"
 CKPT = "weights/groundingdino_swinb_cogcoor.pth"
 PROMPT_LINES = [    
     # "traffic cone",
+    # "debris on road",
     "debris on road",
-    # "car",
-    # "truck",
-    # "bus",
 ]
 PROMPT = ". ".join(PROMPT_LINES) + "."
 BOX_THRESHOLD  = 0.25
@@ -148,64 +147,156 @@ def deduplicate(boxes, labels, scores, iou_thr=IOU_THRESHOLD):
             keep.append(i)
     return boxes[keep], [labels[k] for k in keep], scores[keep]
 
+# ────────────────── 배경 제거기 ────────────────── #
+backSub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
+
 # ────────────────── 비디오 루프 ────────────────── #
 cap = cv2.VideoCapture(VIDEO_PATH)
-frame_skip = 5         # 매 5프레임마다 추론
+frame_skip = 5
 frame_count = 0
+
+# 'image' 폴더가 없으면 생성
+if not os.path.exists('image'):
+    os.makedirs('image')
+
+saved_background_path = os.path.join('image', 'background_img.png')
+saved_background_img = None
+if os.path.exists(saved_background_path):
+    saved_background_img = cv2.imread(saved_background_path)
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
+    # 배경 모델 업데이트를 위해 매 프레임 `apply` 호출
+    t_start = time.time()
+    fg_mask = backSub.apply(frame)
+    t_apply = time.time() - t_start
+
     frame_count += 1
     if frame_count % frame_skip != 0:
         continue
 
-    # 1. ROI 영역 자르기
-    x1, y1, x2, y2 = ROI
-    frame_roi = frame[y1:y2, x1:x2]
-    h_roi, w_roi = frame_roi.shape[:2]
+    # ─── 추론 프레임 처리 ───
+    
+    # 1. 마스크 노이즈 제거
+    t_start = time.time()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_mask_cleaned = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+    t_morph = time.time() - t_start
 
-    # 2. ROI 이미지로 추론 수행
-    img_rgb = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2RGB)
-    img_tensor = preprocess(img_rgb).to(device)
+    # 2. Contour 탐지 및 디버그 시각화
+    t_start = time.time()
+    contours, _ = cv2.findContours(fg_mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    t_contour = time.time() - t_start
+    
+    # 디버그용 시각화 이미지 생성
+    mask_vis_debug = cv2.cvtColor(fg_mask_cleaned, cv2.COLOR_GRAY2BGR)
 
-    with torch.no_grad():
-        raw_boxes, scores, phrases = predict(
-            model=model,
-            image=img_tensor[0],          # (C, H, W)
-            caption=PROMPT,
-            box_threshold=BOX_THRESHOLD,
-            text_threshold=TEXT_THRESHOLD,
-        )
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # 최소 면적 기준을 낮춰서 작은 낙하물도 보이도록 함 (노이즈도 함께 보일 수 있음)
+        if area > 10: 
+            x, y, w, h = cv2.boundingRect(cnt)
+            cv2.rectangle(mask_vis_debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(mask_vis_debug, f"{int(area)}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    # 3. 시각화 준비 (원본 프레임 복사)
+    # 3. 배경 추출 (모델 입력용)
+    t_start = time.time()
+    background_img = backSub.getBackgroundImage()
+    t_get_bg = time.time() - t_start
+
+    # 4. 모델 추론
+    h, w = frame.shape[:2]
+    raw_boxes, scores, phrases = torch.empty(0, 4), torch.empty(0), [] # 기본값
+    bg_diff = None # bg_diff 초기화
+    t_absdiff = 0 # 초기화
+
+    # 4-1. bg_diff 계산 (가능한 경우)
+    if background_img is not None and saved_background_img is not None and background_img.shape == saved_background_img.shape:
+        t_start = time.time()
+        bg_diff = cv2.absdiff(background_img, saved_background_img)
+        t_absdiff = time.time() - t_start
+
+    # 4-2. bg_diff를 사용하여 추론 수행 (bg_diff가 있을 때만)
+    if bg_diff is not None:
+        # ROI 영역 자르기
+        x1, y1, x2, y2 = ROI
+        inference_img_roi = bg_diff[y1:y2, x1:x2]
+        h_roi, w_roi = inference_img_roi.shape[:2]
+
+        # ROI 이미지로 추론 수행
+        img_rgb = cv2.cvtColor(inference_img_roi, cv2.COLOR_BGR2RGB)
+        img_tensor = preprocess(img_rgb).to(device)
+
+        with torch.no_grad():
+            raw_boxes, scores, phrases = predict(
+                model=model,
+                image=img_tensor[0],
+                caption=PROMPT,
+                box_threshold=BOX_THRESHOLD,
+                text_threshold=TEXT_THRESHOLD,
+            )
+
+    # 5. 시각화 (원본 프레임에)
     frame_vis = frame.copy()
-    # ROI 영역 표시
-    cv2.rectangle(frame_vis, (x1, y1), (x2, y2), (255, 0, 255), 2)
+    # ROI 영역 표시 (디버깅용)
+    cv2.rectangle(frame_vis, (ROI[0], ROI[1]), (ROI[2], ROI[3]), (255, 0, 255), 2)
 
-    # 4. 후처리 및 좌표 변환
     if raw_boxes.numel() > 0:
-        # ROI 내부 좌표로 변환
+        # 5-1. 박스 좌표를 ROI 내부 기준으로 변환
         boxes_xyxy = convert_boxes(raw_boxes, w_roi, h_roi)
-        # 전체 프레임 좌표로 변환
-        boxes_xyxy[:, 0::2] += x1
-        boxes_xyxy[:, 1::2] += y1
         
+        # 5-2. 박스 좌표를 전체 프레임 기준으로 변환 (오프셋 추가)
+        boxes_xyxy[:, 0::2] += ROI[0] # x 좌표에 x1 더하기
+        boxes_xyxy[:, 1::2] += ROI[1] # y 좌표에 y1 더하기
+
+        # 5-3. 중복 제거 및 최종 시각화
         boxes_xyxy, phrases, scores = deduplicate(boxes_xyxy, phrases, scores)
-        
-        # 원본 프레임에 시각화
         frame_vis = draw(frame_vis, boxes_xyxy, phrases, scores)
 
-    # 5. 화면 출력
-    h, w = frame.shape[:2]
+    # 6. 화면 출력
     display_scale = 0.8
+    mask_display_scale = 0.8
+    
     frame_display = cv2.resize(frame_vis, (int(w * display_scale), int(h * display_scale)))
+    # 마스크 창에 디버그 시각화 이미지를 표시
+    mask_display = cv2.resize(mask_vis_debug, (int(w * mask_display_scale), int(h * mask_display_scale)))
 
-    cv2.imshow("GroundingDINO", frame_display)
-    if cv2.waitKey(1) == ord('q'):
+    # 배경 이미지 출력    
+    if background_img is not None:
+        background_display = cv2.resize(background_img, (int(w * display_scale), int(h * display_scale)))
+        cv2.imshow("Background (Moving Objects Removed)", background_display)
+
+    # 수행시간 출력
+    print(f"--- Frame {frame_count} Timings ---")
+    print(f"  - backSub.apply():      {t_apply*1000:.2f} ms")
+    print(f"  - cv2.morphologyEx():   {t_morph*1000:.2f} ms")
+    print(f"  - cv2.findContours():   {t_contour*1000:.2f} ms")
+    print(f"  - backSub.getBG():      {t_get_bg*1000:.2f} ms")
+    if bg_diff is not None:
+        print(f"  - cv2.absdiff():        {t_absdiff*1000:.2f} ms")
+
+    cv2.imshow("Result", frame_display)
+    cv2.imshow("Foreground Mask", mask_display)
+
+    # 저장된 배경과의 차이(bg_diff)가 계산된 경우 화면에 표시
+    if bg_diff is not None:
+        bg_diff_display = cv2.resize(bg_diff, (int(w * display_scale), int(h * display_scale)))
+        cv2.imshow("Background Difference", bg_diff_display)
+    
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('s'):
+        if background_img is not None:
+            save_path = os.path.join('image', 'background_img.png')
+            cv2.imwrite(save_path, background_img)
+            saved_background_img = cv2.imread(save_path)
+            print(f"배경 이미지가 '{save_path}'에 저장 및 리로드되었습니다.")
+        else:
+            print("배경 이미지가 아직 생성되지 않았습니다.")
 
 cap.release()
 cv2.destroyAllWindows()
